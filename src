@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""Starter template for the UEH CRC 2026 simulation round.
+
+There is no driving logic here. The node just collects sensor data, calls
+control() 20 times a second, and forwards whatever you ask for to /cmd_vel.
+Write your code in control(), at the bottom of the file.
+
+    ros2 run crc_sim starter
+    ros2 run crc_sim starter --ros-args -p max_speed:=0.15
+
+As shipped it drives forward and stops when the LiDAR sees something close.
+That is a smoke test, not a solution.
+"""
+
+import math
+import signal
+import time
+
+import rclpy
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import Image, LaserScan
+import cv2
+import numpy as np 
+
+try:
+    from cv_bridge import CvBridge
+    HAVE_CV = True
+except ImportError:
+    HAVE_CV = False
+
+
+class Starter(Node):
+
+    def __init__(self):
+        super().__init__('crc_starter')
+
+        self.declare_parameter('max_speed', 0.12)       # m/s
+        self.declare_parameter('max_turn', 1.0)         # rad/s
+        self.declare_parameter('stop_distance', 0.35)   # m
+        self.declare_parameter('rate', 20.0)            # Hz
+
+        self.max_speed = self.get_parameter('max_speed').value
+        self.max_turn = self.get_parameter('max_turn').value
+        self.stop_distance = self.get_parameter('stop_distance').value
+        rate = self.get_parameter('rate').value
+
+        # Latest sensor data. All of these stay None until the first message.
+        self.image = None       # BGR image, 480x640x3
+        self.scan = None        # sensor_msgs/LaserScan
+        self.x = self.y = self.yaw = 0.0
+        self._last_log = {}
+
+        self.bridge = CvBridge() if HAVE_CV else None
+        if not HAVE_CV:
+            self.get_logger().warn(
+                'cv_bridge not found, self.image will stay None. '
+                'apt install ros-humble-cv-bridge python3-opencv')
+
+        self.pub_cmd = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.create_subscription(Image, '/camera/image_raw',
+                                 self.on_image, qos_profile_sensor_data)
+        self.create_subscription(LaserScan, '/scan',
+                                 self.on_scan, qos_profile_sensor_data)
+        self.create_subscription(Odometry, '/odom', self.on_odom, 10)
+
+        self.create_timer(1.0 / rate, self.tick)
+        self.get_logger().info(
+            f'ready | max_speed={self.max_speed} m/s | {rate:.0f} Hz')
+
+    # --- sensor callbacks ---------------------------------------------------
+
+    def on_image(self, msg):
+        if self.bridge is None:
+            return
+        try:
+            self.image = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
+        except Exception as e:
+            self.get_logger().warn(f'image conversion failed: {e}')
+
+    def on_scan(self, msg):
+        self.scan = msg
+
+    def on_odom(self, msg):
+        p = msg.pose.pose.position
+        q = msg.pose.pose.orientation
+        self.x, self.y = p.x, p.y
+        self.yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                              1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+    # --- helpers ------------------------------------------------------------
+
+    def range_at(self, angle_deg, width_deg=10.0):
+        """Closest LiDAR return within +/- width_deg of angle_deg.
+
+        0 is straight ahead, 90 is left, -90 is right. Returns inf if there is
+        no data yet.
+        """
+        if self.scan is None or not self.scan.ranges:
+            return float('inf')
+
+        n = len(self.scan.ranges)
+        best = float('inf')
+        half = int(round(width_deg / 2.0))
+        centre = int(round(angle_deg)) % 360
+        for d in range(-half, half + 1):
+            r = self.scan.ranges[int((centre + d) % 360 * n / 360)]
+            if math.isfinite(r) and r > self.scan.range_min:
+                best = min(best, r)
+        return best
+
+    def drive(self, v, w):
+        """v in m/s forward, w in rad/s counter-clockwise. Both get clamped."""
+        msg = Twist()
+        msg.linear.x = float(max(-self.max_speed, min(self.max_speed, v)))
+        msg.angular.z = float(max(-self.max_turn, min(self.max_turn, w)))
+        self.pub_cmd.publish(msg)
+
+    def stop(self):
+        self.pub_cmd.publish(Twist())
+
+    def log_every(self, seconds, text):
+        """Rate-limited logging, so a message inside control() cannot spam."""
+        now = time.time()
+        if now - self._last_log.get(text[:20], 0.0) >= seconds:
+            self._last_log[text[:20]] = now
+            self.get_logger().info(text)
+
+    def tick(self):
+        try:
+            self.control()
+        except Exception as e:
+            self.get_logger().error(f'control() raised: {e}')
+            self.stop()
+
+    # ------------------------------------------------------------------------
+    # WRITE YOUR CODE BELOW
+    # ------------------------------------------------------------------------
+    def control(self):
+        """Called at rate Hz."""
+        
+        # 1. Đảm bảo camera đã gửi dữ liệu ảnh
+        if self.image is None:
+            return
+
+        if not hasattr(self, 'last_error'):
+            self.last_error = 0.0
+
+        height, width = self.image.shape[:2]
+
+        # === THÊM MỚI: CHỈ DỪNG KHI ĐẾN SÁT MẶT NGƯỜI TÍM (< 0.45m) ===
+        # Lấy khoảng cách LiDAR chính giữa ngay sát đầu xe
+        front_obstacle_dist = self.range_at(0, width_deg=25.0)
+
+        # Cắt ROI gần sát xe hơn (từ 50% chiều cao trở xuống)
+        close_roi = self.image[int(height * 0.5):height, int(width * 0.25):int(width * 0.75)]
+        hsv_close = cv2.cvtColor(close_roi, cv2.COLOR_BGR2HSV)
+        
+        lower_purple = np.array([130, 50, 50])
+        upper_purple = np.array([160, 255, 255])
+        purple_mask = cv2.inRange(hsv_close, lower_purple, upper_purple)
+        
+        # Khi tới rất sát (< 0.45m) VÀ thấy người tím to rõ -> Mới phanh dừng lại
+        if cv2.countNonZero(purple_mask) > 300 and front_obstacle_dist < 0.45:
+            self.log_every(2.0, 'Da toi sat nguoi tim -> Dung lai cho sang duong')
+            self.stop()
+            return
+        # =====================================================================
+
+        # 2. Cắt vùng ảnh lấy 1/3 dưới (từ 2/3 chiều cao đến hết)
+        crop_h = int(height * 2 / 3)
+        roi = self.image[crop_h:height, :]
+
+        roi_blurred = cv2.GaussianBlur(roi, (5, 5), 0)
+
+        # 3. CLAHE (Tăng cường độ tương phản)
+        gray = cv2.cvtColor(roi_blurred, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced_gray = clahe.apply(gray)
+        roi_enhanced = cv2.cvtColor(enhanced_gray, cv2.COLOR_GRAY2BGR)
+
+        # 4. Chuyển HSV & lọc màu trắng
+        hsv = cv2.cvtColor(roi_enhanced, cv2.COLOR_BGR2HSV)
+        lower_white = np.array([0, 0, 140])
+        upper_white = np.array([180, 50, 255])
+        mask = cv2.inRange(hsv, lower_white, upper_white)
+
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.erode(mask, kernel, iterations=1)
+        mask = cv2.dilate(mask, kernel, iterations=2)
+
+        # 5. Giảm bớt vùng xóa ở 2 bên rìa (chỉ xóa 40 pixel mỗi bên)
+        side_crop = 40
+        mask[:, :side_crop] = 0         
+        mask[:, width - side_crop:] = 0
+
+        # 6. Tìm trọng tâm của mảng màu trắng vừa lọc được
+        M = cv2.moments(mask)
+
+        # 7. Ra quyết định bẻ lái
+        if M['m00'] > 0:
+            cx = int(M['m10'] / M['m00'])
+            error = cx - (width / 2)
+            
+            Kp = 0.004
+            Kd = 0.008
+
+            derivative = error - self.last_error
+            self.last_error = error
+
+            v = self.max_speed
+            w = -float(error * Kp + derivative * Kd)
+            
+            self.drive(v, w)
+        else:
+            # KHI MẤT LINE NGHĨA LÀ ĐANG VÀO ĐOẠN ĐỨT GÃY NÊN CHO XE ĐI THẲNG TỰ NHIÊN ĐỂ VƯỢT QUA LẮC
+            self.drive(self.max_speed, 0.0)
+
+
+def catch_sigterm():
+    stopping = {'now': False}
+    signal.signal(signal.SIGTERM, lambda *_: stopping.update(now=True))
+    return stopping
+
+
+def spin(node, stopping):
+    while rclpy.ok() and not stopping['now']:
+        try:
+            rclpy.spin_once(node, timeout_sec=0.1)
+        except Exception:
+            if stopping['now'] or not rclpy.ok():
+                break
+            raise
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    stopping = catch_sigterm()
+    node = Starter()
+    try:
+        spin(node, stopping)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        if rclpy.ok():
+            node.stop()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+
